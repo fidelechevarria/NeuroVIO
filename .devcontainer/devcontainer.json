@@ -1,0 +1,50 @@
+{
+  "name": "NeuroVIO Dev Container",
+  "build": {
+    "dockerfile": "../docker/Dockerfile",
+    "context": ".."
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "cmake.configureOnOpen": true,
+        "C_Cpp.default.cppStandard": "c++20",
+        "C_Cpp.default.cStandard": "c17",
+        "C_Cpp.default.compilerPath": "/usr/bin/clang++-18",
+        "clangd.path": "/usr/bin/clangd-18",
+        "clangd.arguments": [
+          "--background-index",
+          "--clang-tidy",
+          "--header-insertion=iwyu",
+          "--completion-style=detailed",
+          "-j=8"
+        ]
+      },
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "llvm-vs-code-extensions.vscode-clangd",
+        "vadimcn.vscode-lldb",
+        "twxs.cmake"
+      ]
+    }
+  },
+  "forwardPorts": [9876, 8086],
+  "portsAttributes": {
+    "9876": {
+      "label": "Rerun.io Telemetry Viewer",
+      "onAutoForward": "notify"
+    },
+    "8086": {
+      "label": "Tracy Profiler Server",
+      "onAutoForward": "silent"
+    }
+  },
+  "remoteUser": "root",
+  "runArgs": [
+    "--net=host",
+    "--cap-add=SYS_PTRACE",
+    "--security-opt", "seccomp=unconfined"
+  ]
+}

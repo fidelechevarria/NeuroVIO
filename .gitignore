@@ -45,6 +45,9 @@ datasets/
 *.png
 *.jpg
 *.jpeg
+*.tum
+*.onnx
+*.data
 
 # ====================================================================
 # Evaluation, Logs & Visualizer Artifacts

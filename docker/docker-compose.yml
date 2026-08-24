@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  neurovio-dev:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: neurovio-dev
+    volumes:
+      - ..:/workspace:cached
+      - /media/disk1/euroc_mav_dataset:/datasets/euroc:ro
+    environment:
+      - DISPLAY=${DISPLAY}
+      - RERUN_PORT=9876
+    network_mode: "host"
+    ipc: "host"
+    privileged: true
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    command: /bin/bash
