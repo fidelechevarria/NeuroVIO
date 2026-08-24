@@ -1,0 +1,85 @@
+# ====================================================================
+# Build Outputs & Compilers
+# ====================================================================
+build/
+build_*/
+bin/
+lib/
+out/
+dist/
+*.o
+*.obj
+*.so
+*.dylib
+*.a
+*.exe
+*.dll
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+Makefile
+compile_commands.json
+install_manifest.txt
+*.cmake.in
+
+# Package managers (Conan / vcpkg)
+.conan/
+vcpkg_installed/
+
+# ====================================================================
+# Datasets & Heavy Sensor Bags (¡Crítico en Robótica!)
+# ====================================================================
+data/
+datasets/
+*.bag
+*.mcap
+*.zip
+*.tar.gz
+*.tar
+*.7z
+*.mp4
+*.avi
+*.png
+*.jpg
+*.jpeg
+
+# ====================================================================
+# Evaluation, Logs & Visualizer Artifacts
+# ====================================================================
+logs/
+results/
+outputs/
+*.rrd              # Rerun recording files
+*.log
+*.profraw
+*.profdata
+tracy/
+
+# ====================================================================
+# IDEs & Editors
+# ====================================================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.cache/
+.clangd/
+
+# ====================================================================
+# Python (Scripts de evaluación con evo / scripts de utilidades)
+# ====================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+.pytest_cache/
