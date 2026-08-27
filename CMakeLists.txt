@@ -227,7 +227,7 @@ target_link_libraries(neurovio_backend PUBLIC
   neurovio_common
   neurovio_sensors
 )
-if(GTSAM_FOUND)
+if(GTSAM_FOUND OR TARGET gtsam)
   target_link_libraries(neurovio_backend PUBLIC gtsam)
   target_compile_definitions(neurovio_backend PUBLIC NEUROVIO_HAS_GTSAM=1)
 endif()
