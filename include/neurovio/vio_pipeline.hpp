@@ -21,11 +21,17 @@ enum class VioState {
   LOST
 };
 
+enum class TrackerType {
+  NeuroTrack,
+  KLT
+};
+
 class VioPipeline {
  public:
   struct Config {
     ImuParameters imu_params{};
     CameraCalibration camera_calib{};
+    TrackerType tracker_type{TrackerType::NeuroTrack};
     double init_duration_sec{0.5};     // Stationary duration to compute initial gravity alignment
     bool export_tum_trajectory{true};
     std::string tum_output_path{"trajectory_estimate.tum"};

@@ -113,8 +113,6 @@ endif()
 find_package(OpenCV QUIET COMPONENTS core imgproc highgui calib3d features2d video)
 if(OpenCV_FOUND)
   message(STATUS "Found OpenCV ${OpenCV_VERSION} at ${OpenCV_INCLUDE_DIRS}")
-else()
-  message(WARNING "OpenCV not found. Feature tracking and image loading will be limited unless OpenCV is installed.")
 endif()
 
 # 6. ONNX Runtime C++
@@ -127,19 +125,28 @@ if(NEUROVIO_USE_ONNX)
   )
   FetchContent_MakeAvailable(onnxruntime)
 
-  add_library(OnnxRuntime::OnnxRuntime SHARED IMPORTED GLOBAL)
-  set_target_properties(OnnxRuntime::OnnxRuntime PROPERTIES
-    IMPORTED_LOCATION "${onnxruntime_SOURCE_DIR}/lib/libonnxruntime.so"
-    INTERFACE_INCLUDE_DIRECTORIES "${onnxruntime_SOURCE_DIR}/include"
-  )
+  if(NOT TARGET OnnxRuntime::OnnxRuntime)
+    add_library(OnnxRuntime::OnnxRuntime SHARED IMPORTED GLOBAL)
+    set_target_properties(OnnxRuntime::OnnxRuntime PROPERTIES
+      IMPORTED_LOCATION "${onnxruntime_SOURCE_DIR}/lib/libonnxruntime.so"
+      INTERFACE_INCLUDE_DIRECTORIES "${onnxruntime_SOURCE_DIR}/include"
+    )
+  endif()
 endif()
 
 # 7. GTSAM (Optional for backend optimization)
 find_package(GTSAM QUIET)
-if(GTSAM_FOUND)
-  message(STATUS "Found GTSAM ${GTSAM_VERSION}")
-else()
-  message(STATUS "GTSAM not found in standard system paths (backend factor graph will build mock/standalone or GTSAM can be installed in docker).")
+
+# -----------------------------------------------------------------------------
+# NeuroTrack Frontend Subproject Integration
+# -----------------------------------------------------------------------------
+set(NEUROTRACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../NeuroTrack")
+if(EXISTS "${NEUROTRACK_DIR}/CMakeLists.txt")
+  message(STATUS "NeuroVIO: Integrating NeuroTrack from ${NEUROTRACK_DIR}")
+  set(NEUROTRACK_BUILD_APPS OFF CACHE BOOL "" FORCE)
+  set(NEUROTRACK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(NEUROTRACK_ENABLE_CUDA ON CACHE BOOL "" FORCE)
+  add_subdirectory("${NEUROTRACK_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/neurotrack_build" EXCLUDE_FROM_ALL)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -181,8 +188,9 @@ if(OpenCV_FOUND)
   target_compile_definitions(neurovio_sensors PUBLIC NEUROVIO_HAS_OPENCV=1)
 endif()
 
-# 3. neurovio_frontend (KLT Tracker, ONNX SuperPoint, ONNX LightGlue)
+# 3. neurovio_frontend (NeuroTrack Adapter, KLT Tracker, ONNX SuperPoint, ONNX LightGlue)
 add_library(neurovio_frontend
+  src/frontend/neurotrack_frontend.cpp
   src/frontend/klt_tracker.cpp
   src/frontend/onnx_superpoint.cpp
   src/frontend/onnx_lightglue.cpp
@@ -194,6 +202,7 @@ target_include_directories(neurovio_frontend PUBLIC
 target_link_libraries(neurovio_frontend PUBLIC
   neurovio_common
   neurovio_sensors
+  neurotrack
 )
 if(OpenCV_FOUND)
   target_link_libraries(neurovio_frontend PUBLIC ${OpenCV_LIBS})

@@ -1,16 +1,22 @@
 #include "neurovio/vio_pipeline.hpp"
 #include <iomanip>
 #include <spdlog/spdlog.h>
+#include "neurovio/frontend/neurotrack_frontend.hpp"
 #include "neurovio/frontend/klt_tracker.hpp"
 
 namespace neurovio {
 
 VioPipeline::VioPipeline(Config config)
     : config_(std::move(config)),
-      preintegrator_(std::make_unique<ImuPreintegrator>(config_.imu_params)),
-      tracker_(std::make_unique<KltTracker>(config_.camera_calib)) {
+      preintegrator_(std::make_unique<ImuPreintegrator>(config_.imu_params)) {
+  if (config_.tracker_type == TrackerType::NeuroTrack) {
+    tracker_ = std::make_unique<NeuroTrackFrontend>(config_.camera_calib);
+    spdlog::info("VioPipeline: Initialized with NeuroTrack Neural Frontend (GPU/CUDA)");
+  } else {
+    tracker_ = std::make_unique<KltTracker>(config_.camera_calib);
+    spdlog::info("VioPipeline: Initialized with KLT Classical Frontend");
+  }
   state_ = VioState::INITIALIZING_GRAVITY;
-  spdlog::info("VioPipeline: Initialized in INITIALIZING_GRAVITY mode");
 }
 
 VioPipeline::~VioPipeline() {
@@ -106,7 +112,7 @@ void VioPipeline::processFrame(const StereoFrame& frame) {
     return;
   }
 
-  // 1. Visual Feature Tracking
+  // 1. Visual Feature Tracking with NeuroTrack Neural Frontend
   const auto tracks = tracker_->trackFrame(frame.left);
 
   // 2. Register current state to trajectory

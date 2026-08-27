@@ -26,6 +26,13 @@ target_link_libraries(test_euroc_loader PRIVATE
 )
 gtest_discover_tests(test_euroc_loader)
 
+add_executable(test_neurotrack_frontend test_neurotrack_frontend.cpp)
+target_link_libraries(test_neurotrack_frontend PRIVATE
+  neurovio_frontend
+  GTest::gtest_main
+)
+gtest_discover_tests(test_neurotrack_frontend)
+
 if(NEUROVIO_USE_ONNX)
   add_executable(test_onnx_features test_onnx_features.cpp)
   target_link_libraries(test_onnx_features PRIVATE
