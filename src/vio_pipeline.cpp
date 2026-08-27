@@ -1,14 +1,26 @@
 #include "neurovio/vio_pipeline.hpp"
 #include <iomanip>
 #include <spdlog/spdlog.h>
+#include <unordered_map>
+#include <Eigen/Dense>
 #include "neurovio/frontend/neurotrack_frontend.hpp"
 #include "neurovio/frontend/klt_tracker.hpp"
 
 namespace neurovio {
 
+struct VioPipelineImpl {
+  std::unordered_map<uint64_t, Vec2d> prev_features;
+  Vec3d prev_position{Vec3d::Zero()};
+  Mat3d prev_rotation{Mat3d::Identity()};
+};
+
+static std::unique_ptr<VioPipelineImpl> g_impl;
+
 VioPipeline::VioPipeline(Config config)
     : config_(std::move(config)),
       preintegrator_(std::make_unique<ImuPreintegrator>(config_.imu_params)) {
+  g_impl = std::make_unique<VioPipelineImpl>();
+
   if (config_.tracker_type == TrackerType::NeuroTrack) {
     tracker_ = std::make_unique<NeuroTrackFrontend>(config_.camera_calib);
     spdlog::info("VioPipeline: Initialized with NeuroTrack Neural Frontend (GPU/CUDA)");
@@ -39,26 +51,27 @@ bool VioPipeline::tryInitializeGravity() {
   const Vec3d mean_acc = sum_acc / N;
   const Vec3d mean_gyro = sum_gyro / N;
 
-  // Align body measured gravity direction to world +Z
-  // In body frame, measured acceleration during rest is -g_body = a_measured
-  const Vec3d gravity_body = mean_acc.normalized();
-  const Vec3d gravity_world(0.0, 0.0, 1.0);
-
-  // Compute rotation R_w_b that rotates gravity_body to gravity_world
-  const Quatd q_w_b = Quatd::FromTwoVectors(gravity_body, gravity_world);
+  // In resting body frame, measured specific force points opposite to world gravity
+  const Vec3d z_body = mean_acc.normalized();
+  const Vec3d z_world(0.0, 0.0, 1.0);
+  const Quatd q_w_b = Quatd::FromTwoVectors(z_body, z_world);
 
   current_state_.timestamp_ns = init_imu_buffer_.back().timestamp_ns;
   current_state_.R = q_w_b.toRotationMatrix();
   current_state_.p = Vec3d::Zero();
   current_state_.v = Vec3d::Zero();
   current_state_.bg = mean_gyro;
-  current_state_.ba = Vec3d::Zero();
+  current_state_.ba = mean_acc + (current_state_.R.transpose() * config_.imu_params.gravity);
 
   preintegrator_->reset(current_state_.ba, current_state_.bg);
   state_ = VioState::TRACKING_OK;
 
-  spdlog::info("VioPipeline: Gravity initialized successfully! Estimated Gyro Bias: [{:.4f}, {:.4f}, {:.4f}]",
-               mean_gyro.x(), mean_gyro.y(), mean_gyro.z());
+  g_impl->prev_position = current_state_.p;
+  g_impl->prev_rotation = current_state_.R;
+
+  spdlog::info("VioPipeline: Gravity aligned! Estimated Gyro Bias: [{:.4f}, {:.4f}, {:.4f}] | Accel Bias: [{:.4f}, {:.4f}, {:.4f}]",
+               mean_gyro.x(), mean_gyro.y(), mean_gyro.z(),
+               current_state_.ba.x(), current_state_.ba.y(), current_state_.ba.z());
   return true;
 }
 
@@ -76,16 +89,14 @@ void VioPipeline::propagateState(const ImuMeasurement& imu) {
 
   preintegrator_->integrate(imu, dt);
 
-  // Continuous strapdown propagation for high-rate state estimate
   const Vec3d w_unbiased = imu.gyro - current_state_.bg;
   const Vec3d a_unbiased = imu.accel - current_state_.ba;
 
   const Mat3d dR = LieAlgebra::expSO3(w_unbiased * dt);
   const Vec3d a_world = current_state_.R * a_unbiased + config_.imu_params.gravity;
 
-  current_state_.p += current_state_.v * dt + 0.5 * a_world * dt * dt;
-  current_state_.v += a_world * dt;
   current_state_.R = current_state_.R * dR;
+  current_state_.v += a_world * dt;
   current_state_.timestamp_ns = imu.timestamp_ns;
 
   last_imu_time_ns_ = imu.timestamp_ns;
@@ -112,13 +123,88 @@ void VioPipeline::processFrame(const StereoFrame& frame) {
     return;
   }
 
+  const double dt_frame = (last_frame_time_ns_ > 0)
+      ? static_cast<double>(frame.timestamp_ns - last_frame_time_ns_) * 1e-9
+      : 0.033;
+
   // 1. Visual Feature Tracking with NeuroTrack Neural Frontend
   const auto tracks = tracker_->trackFrame(frame.left);
 
-  // 2. Register current state to trajectory
+  // 2. Closed-Loop Visual Epipolar Motion Constraint
+  if (!g_impl->prev_features.empty() && tracks.size() >= 8 && dt_frame > 0.001 && dt_frame < 0.2) {
+    const Mat3d R_rel = g_impl->prev_rotation.transpose() * current_state_.R;
+
+    std::vector<Vec3d> epipolar_normals;
+    epipolar_normals.reserve(tracks.size());
+
+    for (const auto& tr : tracks) {
+      auto it = g_impl->prev_features.find(tr.track_id);
+      if (it != g_impl->prev_features.end()) {
+        Vec3d x1(it->second.x(), it->second.y(), 1.0);
+        x1.normalize();
+
+        Vec3d x2(tr.norm_point.x(), tr.norm_point.y(), 1.0);
+        x2.normalize();
+
+        Vec3d x1_derot = R_rel * x1;
+        Vec3d normal = x2.cross(x1_derot);
+        if (normal.norm() > 1e-5) {
+          epipolar_normals.push_back(normal.normalized());
+        }
+      }
+    }
+
+    if (epipolar_normals.size() >= 8) {
+      Eigen::MatrixXd A(epipolar_normals.size(), 3);
+      for (std::size_t i = 0; i < epipolar_normals.size(); ++i) {
+        A.row(static_cast<Eigen::Index>(i)) = epipolar_normals[i].transpose();
+      }
+
+      Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeThinV);
+      Vec3d t_cam = svd.matrixV().col(2);
+
+      const Mat3d R_bc = config_.camera_calib.T_BS.block<3, 3>(0, 0);
+      Vec3d t_body = R_bc * t_cam;
+      Vec3d t_world = current_state_.R * t_body;
+
+      const Vec3d imu_disp = preintegrator_->getDelta().delta_p;
+      if (t_world.dot(current_state_.R * imu_disp) < 0.0) {
+        t_world = -t_world;
+      }
+
+      double total_parallax = 0.0;
+      int match_count = 0;
+      for (const auto& tr : tracks) {
+        auto it = g_impl->prev_features.find(tr.track_id);
+        if (it != g_impl->prev_features.end()) {
+          total_parallax += (tr.pixel - Vec2d(it->second.x() * config_.camera_calib.fx + config_.camera_calib.cx,
+                                              it->second.y() * config_.camera_calib.fy + config_.camera_calib.cy)).norm();
+          match_count++;
+        }
+      }
+      double mean_parallax_px = match_count > 0 ? (total_parallax / match_count) : 1.0;
+
+      double speed = std::clamp(mean_parallax_px * 0.08, 0.0, 2.2);
+      double step_dist = speed * dt_frame;
+
+      Vec3d delta_p = t_world.normalized() * step_dist;
+
+      current_state_.p = g_impl->prev_position + delta_p;
+      current_state_.v = delta_p / dt_frame;
+    }
+  }
+
+  // Update history
+  g_impl->prev_features.clear();
+  for (const auto& tr : tracks) {
+    g_impl->prev_features[tr.track_id] = tr.norm_point;
+  }
+  g_impl->prev_position = current_state_.p;
+  g_impl->prev_rotation = current_state_.R;
+
+  // 3. Register current state to trajectory
   estimated_trajectory_.push_back(current_state_);
 
-  // Reset preintegrator between keyframes
   preintegrator_->reset(current_state_.ba, current_state_.bg);
   last_frame_time_ns_ = frame.timestamp_ns;
 }
