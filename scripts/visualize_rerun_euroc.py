@@ -80,35 +80,14 @@ def load_tum_trajectory(tum_path):
 
     return np.array(timestamps), np.array(positions), np.array(quaternions)
 
-def umeyama_alignment(model, data, with_scale=True):
+def align_to_ground_truth_origin(gt_pos, est_pos):
     """
-    Standard Umeyama SE(3)/Sim(3) 6-DoF closed-form least squares alignment.
-    Aligns estimated trajectory 'data' to Ground Truth 'model'.
+    Co-locates estimated trajectory so Frame 0 starts at the EXACT same
+    physical coordinates as Ground Truth Frame 0.
     """
-    n = min(len(model), len(data))
-    if n < 3:
-        return data
-
-    m = model[:n]
-    d = data[:n]
-
-    mu_m = m.mean(axis=0)
-    mu_d = d.mean(axis=0)
-
-    cov = (d - mu_d).T @ (m - mu_m) / n
-    var_d = np.var(d, axis=0).sum()
-
-    u, singular, vt = np.linalg.svd(cov)
-    s = np.eye(3)
-    if np.linalg.det(u) * np.linalg.det(vt) < 0:
-        s[2, 2] = -1
-
-    R = vt.T @ s @ u.T
-    scale = (1.0 / var_d * np.trace(np.diag(singular) @ s)) if with_scale else 1.0
-    t = mu_m - scale * (R @ mu_d)
-
-    aligned_data = scale * (data @ R.T) + t
-    return aligned_data
+    if len(est_pos) == 0 or len(gt_pos) == 0:
+        return est_pos
+    return est_pos - est_pos[0] + gt_pos[0]
 
 def main():
     args = parse_args()
@@ -125,26 +104,18 @@ def main():
     print(f"Loaded {len(gt_pos)} Ground Truth poses.")
     print(f"Loaded {len(est_pos)} Estimated VIO poses.\n")
 
+    # Align estimated trajectory to start at the EXACT Ground Truth starting position
     if len(est_pos) > 0 and len(gt_pos) > 0:
-        # Interpolate ground truth to match estimate timestamps
-        gt_interp_pos = np.zeros_like(est_pos)
-        for i, ts in enumerate(est_ts):
-            idx = np.searchsorted(gt_ts, ts)
-            if idx == 0:
-                gt_interp_pos[i] = gt_pos[0]
-            elif idx >= len(gt_ts):
-                gt_interp_pos[i] = gt_pos[-1]
-            else:
-                alpha = (ts - gt_ts[idx - 1]) / max(gt_ts[idx] - gt_ts[idx - 1], 1e-6)
-                gt_interp_pos[i] = (1 - alpha) * gt_pos[idx - 1] + alpha * gt_pos[idx]
-
-        est_pos_aligned = umeyama_alignment(gt_interp_pos, est_pos, with_scale=True)
+        est_pos_aligned = align_to_ground_truth_origin(gt_pos, est_pos)
+        print(f"Ground Truth Start:    {gt_pos[0]}")
+        print(f"NeuroVIO Start:        {est_pos_aligned[0]}")
+        print(f"Initial Offset Diff:   {np.linalg.norm(gt_pos[0] - est_pos_aligned[0]):.6f} m (Exact Match!)\n")
     else:
         est_pos_aligned = est_pos
 
     rr.init("NeuroVIO_3D_Trajectory_Viewer", spawn=True)
 
-    # Log complete Ground Truth 3D path
+    # Log complete Ground Truth 3D path (Green)
     if len(gt_pos) > 0:
         rr.log(
             "world/ground_truth/full_path",
@@ -152,7 +123,7 @@ def main():
             static=True
         )
 
-    # Log complete NeuroVIO estimated 3D path
+    # Log complete NeuroVIO estimated 3D path (Cyan)
     if len(est_pos_aligned) > 0:
         rr.log(
             "world/neurovio/full_path",
@@ -176,7 +147,6 @@ def main():
 
     est_idx = 0
     gt_idx = 0
-    accumulated_est_path = []
 
     for f_idx, (ts_sec, img_path) in enumerate(cam_data):
         rr.set_time("timestamp", timestamp=ts_sec)
@@ -200,12 +170,11 @@ def main():
 
         if len(est_pos_aligned) > est_idx:
             curr_est_p = est_pos_aligned[est_idx]
-            accumulated_est_path.append(curr_est_p)
             rr.log("world/neurovio/drone_pose", rr.Points3D([curr_est_p], colors=[[0, 180, 255]], radii=0.18))
 
             if len(gt_pos) > gt_idx:
                 err = np.linalg.norm(curr_gt_p - curr_est_p)
-                rr.log("metrics/ate_position_error_m", rr.Scalars(err))
+                rr.log("metrics/position_error_m", rr.Scalars(err))
 
         if f_idx % 200 == 0 or f_idx == len(cam_data) - 1:
             print(f"[{f_idx}/{len(cam_data)}] Timestamp: {ts_sec:.3f} s | Logged to Rerun.io")

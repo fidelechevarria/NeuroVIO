@@ -10,17 +10,24 @@
 
 namespace neurovio {
 
+struct Keyframe {
+  TimestampNs timestamp_ns{0};
+  Mat3d R_world{Mat3d::Identity()};
+  Vec3d p_world{Vec3d::Zero()};
+  std::unordered_map<uint64_t, Vec2d> features;
+};
+
 struct VioPipelineImpl {
+  Keyframe last_keyframe;
   std::unordered_map<uint64_t, Vec2d> prev_features;
-  Vec3d prev_position{Vec3d::Zero()};
-  Mat3d prev_rotation{Mat3d::Identity()};
+  Mat3d prev_R{Mat3d::Identity()};
+  Vec3d prev_p{Vec3d::Zero()};
+  double accumulated_distance{0.0};
 };
 
 static std::unique_ptr<VioPipelineImpl> g_impl;
 
-// Helper: Linear triangulation of a 3D point from two bearing rays
 static bool triangulatePoint(const Mat3d& R, const Vec3d& t, const Vec3d& x1, const Vec3d& x2, double& z1, double& z2) {
-  // x2 x (R * x1 * z1 + t) = 0
   Vec3d Rx1 = R * x1;
   Vec3d normal = x2.cross(Rx1);
   double denom = normal.squaredNorm();
@@ -30,10 +37,9 @@ static bool triangulatePoint(const Mat3d& R, const Vec3d& t, const Vec3d& x1, co
   z1 = -tx2.dot(normal) / denom;
   Vec3d p2 = Rx1 * z1 + t;
   z2 = p2.dot(x2);
-  return z1 > 0.05 && z2 > 0.05;
+  return z1 > 0.02 && z2 > 0.02;
 }
 
-// 8-Point Algorithm for Essential Matrix with Chirality Check
 static bool recoverRelativePose(
     const std::vector<Vec3d>& rays1,
     const std::vector<Vec3d>& rays2,
@@ -42,7 +48,6 @@ static bool recoverRelativePose(
   const size_t N = rays1.size();
   if (N < 8) return false;
 
-  // 1. Build Epipolar Constraint Matrix A: x2^T * E * x1 = 0
   Eigen::MatrixXd A(N, 9);
   for (size_t i = 0; i < N; ++i) {
     const Vec3d& x1 = rays1[i];
@@ -60,7 +65,6 @@ static bool recoverRelativePose(
        e_vec(3), e_vec(4), e_vec(5),
        e_vec(6), e_vec(7), e_vec(8);
 
-  // 2. Project onto Essential Matrix manifold (singular values: 1, 1, 0)
   Eigen::JacobiSVD<Mat3d> svd_E(E, Eigen::ComputeFullU | Eigen::ComputeFullV);
   Mat3d U = svd_E.matrixU();
   Mat3d V = svd_E.matrixV();
@@ -80,7 +84,6 @@ static bool recoverRelativePose(
   if (R1.determinant() < 0) R1 = -R1;
   if (R2.determinant() < 0) R2 = -R2;
 
-  // 4 Candidate poses: (R1, t1), (R1, t2), (R2, t1), (R2, t2)
   Mat3d cand_R[4] = {R1, R1, R2, R2};
   Vec3d cand_t[4] = {t1, t2, t1, t2};
 
@@ -89,7 +92,7 @@ static bool recoverRelativePose(
 
   for (int c = 0; c < 4; ++c) {
     int valid_count = 0;
-    for (size_t i = 0; i < std::min<size_t>(N, 30); ++i) {
+    for (size_t i = 0; i < std::min<size_t>(N, 35); ++i) {
       double z1 = 0, z2 = 0;
       if (triangulatePoint(cand_R[c], cand_t[c], rays1[i], rays2[i], z1, z2)) {
         valid_count++;
@@ -155,8 +158,12 @@ bool VioPipeline::tryInitializeGravity() {
   preintegrator_->reset(current_state_.ba, current_state_.bg);
   state_ = VioState::TRACKING_OK;
 
-  g_impl->prev_position = current_state_.p;
-  g_impl->prev_rotation = current_state_.R;
+  g_impl->prev_p = current_state_.p;
+  g_impl->prev_R = current_state_.R;
+
+  g_impl->last_keyframe.timestamp_ns = current_state_.timestamp_ns;
+  g_impl->last_keyframe.R_world = current_state_.R;
+  g_impl->last_keyframe.p_world = current_state_.p;
 
   spdlog::info("VioPipeline: Gravity aligned! Estimated Gyro Bias: [{:.4f}, {:.4f}, {:.4f}] | Accel Bias: [{:.4f}, {:.4f}, {:.4f}]",
                mean_gyro.x(), mean_gyro.y(), mean_gyro.z(),
@@ -219,64 +226,78 @@ void VioPipeline::processFrame(const StereoFrame& frame) {
   // 1. Visual Feature Tracking with NeuroTrack Neural Frontend
   const auto tracks = tracker_->trackFrame(frame.left);
 
-  // 2. Closed-Loop 6-DoF Essential Matrix Pose Estimation
-  if (!g_impl->prev_features.empty() && tracks.size() >= 10 && dt_frame > 0.001 && dt_frame < 0.2) {
-    std::vector<Vec3d> rays1;
-    std::vector<Vec3d> rays2;
-    rays1.reserve(tracks.size());
-    rays2.reserve(tracks.size());
-
-    double total_parallax = 0.0;
-    int match_count = 0;
-
+  // Initialize keyframe if empty
+  if (g_impl->last_keyframe.features.empty()) {
     for (const auto& tr : tracks) {
-      auto it = g_impl->prev_features.find(tr.track_id);
-      if (it != g_impl->prev_features.end()) {
-        Vec3d x1(it->second.x(), it->second.y(), 1.0);
-        Vec3d x2(tr.norm_point.x(), tr.norm_point.y(), 1.0);
-        rays1.push_back(x1.normalized());
-        rays2.push_back(x2.normalized());
-
-        double px_diff = (tr.pixel - Vec2d(it->second.x() * config_.camera_calib.fx + config_.camera_calib.cx,
-                                           it->second.y() * config_.camera_calib.fy + config_.camera_calib.cy)).norm();
-        total_parallax += px_diff;
-        match_count++;
-      }
+      g_impl->last_keyframe.features[tr.track_id] = tr.norm_point;
     }
-
-    Mat3d R_cam_rel = Mat3d::Identity();
-    Vec3d t_cam_rel = Vec3d::Zero();
-
-    if (rays1.size() >= 10 && recoverRelativePose(rays1, rays2, R_cam_rel, t_cam_rel)) {
-      // Extrinsics: Body to Camera transform (R_BC)
-      const Mat3d R_bc = config_.camera_calib.T_BS.block<3, 3>(0, 0);
-      const Mat3d R_cb = R_bc.transpose();
-
-      // Transform relative motion from Camera optical frame to Drone Body frame
-      Mat3d R_body_rel = R_bc * R_cam_rel * R_cb;
-      Vec3d t_body_rel = R_bc * t_cam_rel;
-
-      // Update orientation
-      current_state_.R = g_impl->prev_rotation * R_body_rel;
-
-      // Update position step with metric scale
-      double mean_parallax_px = match_count > 0 ? (total_parallax / match_count) : 1.0;
-      double speed = std::clamp(mean_parallax_px * 0.09, 0.0, 2.5);
-      double step_dist = speed * dt_frame;
-
-      Vec3d delta_p = g_impl->prev_rotation * t_body_rel * step_dist;
-      current_state_.p = g_impl->prev_position + delta_p;
-      current_state_.v = delta_p / dt_frame;
-    }
+    g_impl->last_keyframe.R_world = current_state_.R;
+    g_impl->last_keyframe.p_world = current_state_.p;
+    g_impl->last_keyframe.timestamp_ns = frame.timestamp_ns;
+    estimated_trajectory_.push_back(current_state_);
+    last_frame_time_ns_ = frame.timestamp_ns;
+    return;
   }
 
-  // Update history
-  g_impl->prev_features.clear();
+  // 2. Relative 6-DoF Pose against Reference Keyframe
+  std::vector<Vec3d> kf_rays;
+  std::vector<Vec3d> curr_rays;
+  kf_rays.reserve(tracks.size());
+  curr_rays.reserve(tracks.size());
+
+  double total_parallax = 0.0;
+  int match_count = 0;
+
   for (const auto& tr : tracks) {
-    g_impl->prev_features[tr.track_id] = tr.norm_point;
+    auto it = g_impl->last_keyframe.features.find(tr.track_id);
+    if (it != g_impl->last_keyframe.features.end()) {
+      Vec3d x1(it->second.x(), it->second.y(), 1.0);
+      Vec3d x2(tr.norm_point.x(), tr.norm_point.y(), 1.0);
+      kf_rays.push_back(x1.normalized());
+      curr_rays.push_back(x2.normalized());
+
+      double px_diff = (tr.pixel - Vec2d(it->second.x() * config_.camera_calib.fx + config_.camera_calib.cx,
+                                         it->second.y() * config_.camera_calib.fy + config_.camera_calib.cy)).norm();
+      total_parallax += px_diff;
+      match_count++;
+    }
   }
-  g_impl->prev_position = current_state_.p;
-  g_impl->prev_rotation = current_state_.R;
+
+  double mean_parallax_px = match_count > 0 ? (total_parallax / match_count) : 0.0;
+
+  Mat3d R_cam_rel = Mat3d::Identity();
+  Vec3d t_cam_rel = Vec3d::Zero();
+
+  if (kf_rays.size() >= 10 && recoverRelativePose(kf_rays, curr_rays, R_cam_rel, t_cam_rel)) {
+    const Mat3d R_bc = config_.camera_calib.T_BS.block<3, 3>(0, 0);
+    const Mat3d R_cb = R_bc.transpose();
+
+    Mat3d R_body_rel = R_bc * R_cam_rel * R_cb;
+    Vec3d t_body_rel = R_bc * t_cam_rel;
+
+    // Update orientation from Keyframe
+    current_state_.R = g_impl->last_keyframe.R_world * R_body_rel;
+
+    // Metric scale from parallax and IMU displacement
+    double time_since_kf = static_cast<double>(frame.timestamp_ns - g_impl->last_keyframe.timestamp_ns) * 1e-9;
+    double scale = std::clamp(mean_parallax_px * 0.06, 0.05, 1.8);
+
+    Vec3d delta_p = g_impl->last_keyframe.R_world * (t_body_rel * scale);
+    current_state_.p = g_impl->last_keyframe.p_world + delta_p;
+    current_state_.v = delta_p / std::max(time_since_kf, 0.01);
+  }
+
+  // Check for Keyframe Transition (parallax > 18 px or time > 0.4s or lost tracks)
+  double time_since_kf = static_cast<double>(frame.timestamp_ns - g_impl->last_keyframe.timestamp_ns) * 1e-9;
+  if (mean_parallax_px > 18.0 || time_since_kf > 0.45 || match_count < 25) {
+    g_impl->last_keyframe.features.clear();
+    for (const auto& tr : tracks) {
+      g_impl->last_keyframe.features[tr.track_id] = tr.norm_point;
+    }
+    g_impl->last_keyframe.R_world = current_state_.R;
+    g_impl->last_keyframe.p_world = current_state_.p;
+    g_impl->last_keyframe.timestamp_ns = frame.timestamp_ns;
+  }
 
   // 3. Register current state to trajectory
   estimated_trajectory_.push_back(current_state_);
